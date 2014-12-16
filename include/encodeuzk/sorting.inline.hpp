@@ -185,5 +185,171 @@ void forceAtMostPw(VarAllocator &allocator, ClauseEmitter &emitter,
 	forceFalse(allocator, emitter, outs[weight]);
 }
 
+template<typename Weight>
+std::vector<int> convertBase(Weight num, const std::vector<int> &base) {
+	std::vector<int> products(base.size());
+	products[0] = 1;
+	for(int i = 1; i < base.size(); i++) {
+		products[i] = products[i - 1] * base[i];
+	}
+
+	std::vector<int> digits(base.size());
+	for(int i = base.size() - 1; i >= 0; i--) {
+		Weight k = num / products[i];
+		assert(k < std::numeric_limits<int>::max());
+		digits[i] = k;
+		num -= k * products[i];
+	}
+	return digits;
+}
+
+template<typename Literal>
+using SorterLits = std::vector<Literal>;
+
+template<typename Literal>
+using SorterNetwork = std::vector<SorterLits<Literal>>;
+
+template<typename VarAllocator, typename ClauseEmitter,
+		typename Weight>
+SorterNetwork<typename ClauseEmitter::Literal>
+computeSorterNetwork(VarAllocator &allocator, ClauseEmitter &emitter,
+		const std::vector<typename ClauseEmitter::Literal> &lits,
+		const std::vector<Weight> &weights, const std::vector<int> &base) {
+	// we need a literal that is always zero to simplify sorting
+	typename ClauseEmitter::Literal null_lit = allocator.allocate().oneLiteral();
+	emit(emitter, { null_lit.inverse() });
+	
+	SorterNetwork<typename ClauseEmitter::Literal> sorters;
+
+	for(int k = 0; k < base.size(); k++) {
+		std::vector<typename ClauseEmitter::Literal> ins;
+
+		// add carry bits from previous sorter as input
+		if(k > 0) {
+			for(int j = base[k] - 1; j < sorters.back().size(); j += base[k])
+				ins.push_back(sorters.back()[j]);
+		}
+
+		for(int i = 0; i < lits.size(); i++) {
+			std::vector<int> weight = convertBase(weights[i], base);
+			for(int j = 0; j < weight[k]; j++)
+				ins.push_back(lits[i]);
+		}
+
+		std::vector<typename ClauseEmitter::Literal> outs
+				= computePwSort(allocator, emitter, ins, null_lit);
+		std::cout << "c Size of sorter " << k << ": " << outs.size() << std::endl;
+		sorters.push_back(outs);
+	}
+
+	return sorters;
+}
+
+// produces the constraint sorter >= target
+template<typename VarAllocator, typename ClauseEmitter>
+typename ClauseEmitter::Literal computeSorterGe(VarAllocator &allocator, ClauseEmitter &emitter,
+		const SorterLits<typename ClauseEmitter::Literal> &sorter, int target) {
+	if(target == 0) {
+		typename ClauseEmitter::Variable r = allocator.allocate();
+
+		// trivial case 1: every number is >= 0
+		emit(emitter, { r.oneLiteral() });
+
+		return r.oneLiteral();
+	}else if(sorter.size() < target) {
+		typename ClauseEmitter::Variable r = allocator.allocate();
+
+		// trivial case 2: the sorter is not big enough to reach the limit
+		emit(emitter, { r.zeroLiteral() });
+
+		return r.oneLiteral();
+	}
+
+	return sorter[target - 1];
+}
+
+// produces the constraint sorter % divisor >= target
+template<typename VarAllocator, typename ClauseEmitter>
+typename ClauseEmitter::Literal computeSorterRemainderGe(VarAllocator &allocator, ClauseEmitter &emitter,
+		const SorterLits<typename ClauseEmitter::Literal> &sorter, int divisor, int target) {
+	if(target == 0) {
+		typename ClauseEmitter::Variable r = allocator.allocate();
+	
+		// trivial case 1: every number is >= 0
+		emit(emitter, { r.oneLiteral() });
+
+		return r.oneLiteral();
+	}else if(sorter.size() < target) {
+		typename ClauseEmitter::Variable r = allocator.allocate();
+	
+		// trivial case 2: the sorter is not big enough to reach the limit
+		emit(emitter, { r.zeroLiteral() });
+		
+		return r.oneLiteral();
+	}else if(divisor <= target) {
+		typename ClauseEmitter::Variable r = allocator.allocate();
+	
+		// trivial case 3: the modulus is not big enough to reach the limit
+		emit(emitter, { r.zeroLiteral() });
+		
+		return r.oneLiteral();
+	}
+	
+	std::vector<typename ClauseEmitter::Literal> disjunction;
+	for(int k = 0; k < sorter.size(); k += divisor) {
+		if(k + target - 1 >= sorter.size())
+			break;
+
+		if(k + divisor - 1 < sorter.size()) {
+			disjunction.push_back(computeAnd(allocator, emitter,
+					sorter[k + target - 1], sorter[k + divisor - 1].inverse()));
+		}else{
+			disjunction.push_back(sorter[k + target - 1]);
+		}
+	}
+	
+	return computeOrN(allocator, emitter,
+			disjunction.begin(), disjunction.end());
+}
+
+// produces the constraint network >= rhs
+template<typename VarAllocator, typename ClauseEmitter>
+typename ClauseEmitter::Literal computeSorterNetworkGe(VarAllocator &allocator, ClauseEmitter &emitter,
+		const SorterNetwork<typename ClauseEmitter::Literal> &network,
+		const std::vector<int> &base, const std::vector<int> &rhs, int i) {
+	if(i == 0) {
+		typename ClauseEmitter::Variable r = allocator.allocate();
+
+		// trivial case: every number is >= 0
+		emit(emitter, { r.oneLiteral() });
+		
+		return r.oneLiteral();
+	}
+
+	typename ClauseEmitter::Literal p
+			= computeSorterNetworkGe(allocator, emitter, network, base, rhs, i - 1);
+	
+	typename ClauseEmitter::Literal gt;
+	typename ClauseEmitter::Literal ge;
+	if(i == base.size()) {
+		gt = computeSorterGe(allocator, emitter, network[i - 1], rhs[i - 1] + 1);
+		ge = computeSorterGe(allocator, emitter, network[i - 1], rhs[i - 1]);
+	}else{
+		gt = computeSorterRemainderGe(allocator, emitter, network[i - 1], base[i], rhs[i - 1] + 1);
+		ge = computeSorterRemainderGe(allocator, emitter, network[i - 1], base[i], rhs[i - 1]);
+	}
+	
+	return computeOr(allocator, emitter, gt,
+			computeAnd(allocator, emitter, ge, p));
+}
+
+template<typename VarAllocator, typename ClauseEmitter>
+typename ClauseEmitter::Literal computeSorterNetworkGe(VarAllocator &allocator, ClauseEmitter &emitter,
+		const SorterNetwork<typename ClauseEmitter::Literal> &network,
+		const std::vector<int> &base, const std::vector<int> &rhs) {
+	return computeSorterNetworkGe(allocator, emitter, network, base, rhs,
+			network.size());
+}
+
 } // namespace encodeuzk
 
