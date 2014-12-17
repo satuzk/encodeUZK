@@ -185,24 +185,6 @@ void forceAtMostPw(VarAllocator &allocator, ClauseEmitter &emitter,
 	forceFalse(allocator, emitter, outs[weight]);
 }
 
-template<typename Weight>
-std::vector<int> convertBase(Weight num, const std::vector<int> &base) {
-	std::vector<int> products(base.size());
-	products[0] = 1;
-	for(int i = 1; i < base.size(); i++) {
-		products[i] = products[i - 1] * base[i];
-	}
-
-	std::vector<int> digits(base.size());
-	for(int i = base.size() - 1; i >= 0; i--) {
-		Weight k = num / products[i];
-		assert(k < std::numeric_limits<int>::max());
-		digits[i] = k;
-		num -= k * products[i];
-	}
-	return digits;
-}
-
 template<typename Literal>
 using SorterLits = std::vector<Literal>;
 
